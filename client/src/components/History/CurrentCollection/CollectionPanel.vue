@@ -5,20 +5,23 @@ import { computed, ref, watch } from "vue";
 
 import {
     canMutateHistory,
+    type CollectionElementDataset,
     type CollectionEntry,
     type DCESummary,
+    type HDADetailed,
     type HDCASummary,
-    type HistoryItemSummary,
     type HistorySummary,
     isCollectionElement,
+    isDatasetElement,
+    isDCE,
     isHDCA,
     type SubCollection,
 } from "@/api";
 import ExpandedItems from "@/components/History/Content/ExpandedItems";
-import { HistoryFilters } from "@/components/History/HistoryFilters";
 import { updateContentFields } from "@/components/History/model/queries";
 import { useSelectedItems } from "@/composables/selectedItems/selectedItems";
-import { useCollectionElementsStore } from "@/stores/collectionElementsStore";
+import { isPlaceholder, useCollectionElementsStore } from "@/stores/collectionElementsStore";
+import { useDatasetStore } from "@/stores/datasetStore";
 import { setItemDragstart } from "@/utils/setDrag";
 import { errorMessageAsString } from "@/utils/simple-error";
 
@@ -43,13 +46,8 @@ const props = withDefaults(defineProps<Props>(), {
     filterable: false,
 });
 
-function onCreatedCollection() {
-    resetSelection();
-    setShowSelection(false);
-    showCollectionCreator.value = false;
-}
-
 const collectionElementsStore = useCollectionElementsStore();
+const datasetStore = useDatasetStore();
 
 const emit = defineEmits<{
     (e: "view-collection", collection: CollectionEntry): void;
@@ -90,56 +88,28 @@ const rootCollection = computed(() => {
 const isRoot = computed(() => dsc.value == rootCollection.value);
 const canEdit = computed(() => isRoot.value && canMutateHistory(props.history));
 
-/** Selection inside a collection uses the same composable as the history
- * panel, so selecting behaves identically in both places: a select toggle,
- * click to select without opening the item, and shift for a range. */
 const showCollectionCreator = ref(false);
 
-/** Selection is keyed on the dataset an element points at, not on the element.
- * ContentItem hands its own `item` to the click handler, and that item is the
- * dataset, so keying on anything else makes every click resolve to the same
- * key and selection stops behaving like the history panel's. */
-function datasetKey(item: HistoryItemSummary) {
-    return String(item?.id);
-}
-
-/** Enriched dataset for an element, so selecting stores the same object the
- * list holds (with a name) rather than the bare one on the element.
+/** The datasets behind this collection's elements, in listing order.
  *
- * Cached per element: the template asks for this several times per row on
- * every render, and rebuilding the object each time churns through a large
- * collection for nothing.
- */
-const datasetCache = new WeakMap<object, HistoryItemSummary>();
-
-function datasetFor(element: DCESummary) {
-    const cached = datasetCache.get(element);
-    if (cached) {
-        return cached;
-    }
-    const dataset = {
-        ...element.object,
-        name: element.element_identifier,
-        // The element's dataset carries no history_content_type. Without it the
-        // collection creator treats the item as a collection and looks its id
-        // up as an HDCA, which fails with "History dataset collection
-        // association not found".
-        history_content_type: "dataset",
-    } as HistoryItemSummary;
-    datasetCache.set(element, dataset);
-    return dataset;
-}
-
-/** The datasets behind this collection's elements, in listing order. */
+ * Range selection is positional (`allItems.indexOf(item)`), so these must be the store's
+ * own objects — a row deriving a second identity here stops being found. */
 const selectableDatasets = computed(() =>
     collectionElements.value
-        .filter((element): element is DCESummary => "element_type" in element && element.element_type === "hda")
-        // The element carries the dataset, which has no name of its own: inside
-        // a collection the displayed name is the element identifier. Carry it
-        // across, or anything downstream (the collection creator) shows
-        // "undefined" where a name should be.
-        .map(datasetFor),
+        .filter(isDCE)
+        .filter(isDatasetElement)
+        .map((element) => element.object),
 );
+
+/** Placeholders a selection cannot reach — reported so a build does not quietly cover
+ * part of the collection. */
+const unloadedElementCount = computed(() => collectionElements.value.filter(isPlaceholder).length);
+
+/** A collection selects element occurrences, which remain distinct when they reference the
+ * same HDA. */
+function collectionElementDatasetKey(item: CollectionElementDataset) {
+    return `dataset-collection-element-${item.collection_element_id}`;
+}
 
 const {
     selectedItems,
@@ -150,30 +120,67 @@ const {
     isSelected,
     setSelected,
     initKeySelection,
-    resetSelection,
     itemRefs,
     onClick: onSelectClick,
     onKeyDown: onSelectKeyDown,
-} = useSelectedItems<HistoryItemSummary, typeof ContentItem>({
+} = useSelectedItems<CollectionElementDataset, typeof ContentItem>({
     scopeKey: computed(() => String(dsc.value?.id ?? "")),
-    getItemKey: datasetKey,
-    allItems: selectableDatasets as never,
+    getItemKey: collectionElementDatasetKey,
+    allItems: selectableDatasets,
     selectable: computed(() => canEdit.value),
     expectedKeyDownClass: "content-item",
-    // Matches the history panel so keyboard navigation behaves the same.
     disallowedKeyDownClasses: ["sub-item"],
-    // A collection listing has no filtering and no query selection, so these
-    // are inert; they exist because the composable is shared with the history
-    // panel, where filtering drives select-all-in-query.
-    filterText: ref(""),
-    totalItemsInQuery: computed(() => selectableDatasets.value.length),
-    filterClass: HistoryFilters,
+    // No `querySelection`: a collection listing has no filter behind it, so selection can
+    // only ever cover the elements that are loaded.
     // Deleting an element from a collection is not offered here.
     onDelete: () => {},
 });
 
-/** The datasets behind the selected elements, for the collection creator. */
-const selectedDatasets = computed(() => Array.from(selectedItems.value.values()));
+/** The datasets the collection creator was opened with, hydrated from `selectedItems`. */
+const selectedDatasets = ref<HDADetailed[]>([]);
+const loadingSelection = ref(false);
+const selectionError = ref<string | null>(null);
+
+/** The contents API serves a minimal element payload, without the `extension`, `hid`,
+ * `deleted` and `visible` the collection builders read, so expand the selection before
+ * handing it over. `datasetStore` also backs the row's expanded details view, so a row the
+ * user already opened is a cache hit.
+ *
+ * `CollectionCreatorIndex`'s own hydration watcher cannot do this: it fills gaps from
+ * `historyDatasetsStore`, which fetches with `visible: true`, and collection elements are
+ * hidden. */
+async function onBuildCollection() {
+    loadingSelection.value = true;
+    selectionError.value = null;
+    const selectedElements = Array.from(selectedItems.value.values());
+    const ids = selectedElements.map((dataset) => dataset.id);
+    const datasets = await Promise.all(ids.map((id) => datasetStore.fetchDataset({ id })));
+    loadingSelection.value = false;
+
+    const failedId = ids.find((id, index) => datasets[index] === undefined);
+    if (failedId !== undefined) {
+        selectionError.value = errorMessageAsString(datasetStore.getDatasetError(failedId));
+        return;
+    }
+    selectedDatasets.value = datasets.map((dataset, index) => ({
+        ...(dataset as HDADetailed),
+        name: selectedElements[index]!.element_identifier,
+    }));
+    showCollectionCreator.value = true;
+}
+
+function onCreatedCollection() {
+    // `watch(showSelection)` in the composable resets the selection when it is hidden.
+    setShowSelection(false);
+    selectedDatasets.value = [];
+    showCollectionCreator.value = false;
+}
+
+/** `ContentItem` has already persisted the change; reflect it on the stored element so the
+ * row keeps showing it. */
+function onTagChange(item: CollectionElementDataset, newTags: string[]) {
+    item.tags = newTags;
+}
 
 async function updateDsc(collection: CollectionEntry, fields: Object | undefined) {
     if (!isHDCA(collection)) {
@@ -239,16 +246,20 @@ watch(
                     v-on="$listeners" />
                 <CollectionDetails :dsc="dsc" :writeable="canEdit" @update:dsc="updateDsc(dsc, $event)" />
                 <CollectionOperations
-                    v-if="showControls"
+                    v-if="canEdit && showControls"
                     :dsc="dsc"
-                    :selectable="canEdit"
                     :show-selection="showSelection"
                     :selection-size="selectionSize"
+                    :unloaded-element-count="unloadedElementCount"
+                    :building-collection="loadingSelection"
                     @update:show-selection="setShowSelection"
-                    @build-collection="showCollectionCreator = true" />
+                    @build-collection="onBuildCollection" />
             </section>
             <section class="position-relative flex-grow-1 scroller">
                 <div>
+                    <b-alert v-if="selectionError" class="m-2" variant="danger" show>
+                        {{ selectionError }}
+                    </b-alert>
                     <b-alert
                         v-if="collectionElements.length === 0"
                         class="m-2"
@@ -270,24 +281,35 @@ watch(
                                 :is-placeholder="true"
                                 name="Loading..." />
                             <ContentItem
-                                v-else
+                                v-else-if="isDatasetElement(item)"
                                 :id="item.element_index + 1"
-                                :ref="itemRefs[datasetKey(datasetFor(item))]"
+                                :ref="itemRefs[collectionElementDatasetKey(item.object)]"
                                 :item="item.object"
                                 :name="item.element_identifier"
-                                :expand-dataset="isExpanded(item)"
-                                :is-dataset="item.element_type == 'hda'"
-                                :taggable="item.element_type == 'hda'"
+                                taggable
                                 :writable="canEdit"
-                                :get-item-key="datasetKey"
-                                :selectable="showSelection && item.element_type == 'hda'"
-                                :selected="isSelected(datasetFor(item))"
-                                :is-range-select-anchor="isRangeSelectAnchor(datasetFor(item))"
+                                :expand-dataset="isExpanded(item)"
+                                :get-item-key="collectionElementDatasetKey"
+                                :selectable="showSelection"
+                                :selected="isSelected(item.object)"
+                                :is-range-select-anchor="isRangeSelectAnchor(item.object)"
                                 :select-click-handler="onSelectClick"
                                 :filterable="filterable"
-                                @update:selected="setSelected(datasetFor(item), $event)"
+                                @update:selected="setSelected(item.object, $event)"
                                 @init-key-selection="initKeySelection"
-                                @on-key-down="onSelectKeyDown(datasetFor(item), $event)"
+                                @on-key-down="onSelectKeyDown(item.object, $event)"
+                                @tag-change="onTagChange"
+                                @drag-start="setItemDragstart(item, $event)"
+                                @update:expand-dataset="setExpanded(item, $event)" />
+                            <!-- A sub-collection row drills down rather than selecting. -->
+                            <ContentItem
+                                v-else
+                                :id="item.element_index + 1"
+                                :item="item.object"
+                                :name="item.element_identifier"
+                                :is-dataset="false"
+                                :expand-dataset="isExpanded(item)"
+                                :filterable="filterable"
                                 @drag-start="setItemDragstart(item, $event)"
                                 @update:expand-dataset="setExpanded(item, $event)"
                                 @view-collection="onViewDatasetCollectionElement(item)" />

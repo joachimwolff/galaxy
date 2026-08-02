@@ -143,40 +143,63 @@ describe("ContentItem", () => {
     });
 
     it("enables tags for a taggable item that is not a history item", async () => {
-        // A collection element wraps a real dataset, so its tags are editable
-        // even though the element itself is not a history item.
         await wrapper.setProps({ isHistoryItem: false, taggable: true });
 
         const tags = wrapper.findComponent(StatelessTags);
         expect(tags.props("disabled")).toBe(false);
     });
 
-    it("fills in the content type when saving tags for an item that lacks one", async () => {
-        // The dataset carried by a collection element has a history_id but no
-        // history_content_type; without it the update is addressed to
-        // "undefineds".
-        const elementDataset = { id: "elem_id", tags: [], deleted: false, visible: true };
+    it("saves tags against the item exactly as given, without patching it", async () => {
+        // Callers hand down an item already shaped as history content; this component is
+        // shared across every listing and must not compensate for one caller's payload.
+        const elementDataset = {
+            id: "elem_id",
+            history_id: "history_id",
+            history_content_type: "dataset",
+            tags: [],
+        };
         await wrapper.setProps({ item: elementDataset, isHistoryItem: false, taggable: true });
 
         wrapper.findComponent(StatelessTags).vm.$emit("input", ["added"]);
         await localVue.nextTick();
 
-        expect(updateContentFields).toHaveBeenCalledWith(
-            expect.objectContaining({ id: "elem_id", history_content_type: "dataset" }),
-            { tags: ["added"] },
-        );
+        expect(updateContentFields).toHaveBeenCalledWith(elementDataset, { tags: ["added"] });
     });
 
-    it("shows a tag added to an item that nothing else refreshes", async () => {
-        const elementDataset = { id: "elem_id", tags: [], deleted: false, visible: true };
+    it("emits tag-change with the item so the owner can write the change back", async () => {
+        const elementDataset = {
+            id: "elem_id",
+            history_id: "history_id",
+            history_content_type: "dataset",
+            tags: [],
+        };
         await wrapper.setProps({ item: elementDataset, isHistoryItem: false, taggable: true });
 
         wrapper.findComponent(StatelessTags).vm.$emit("input", ["added"]);
         await localVue.nextTick();
 
-        // A history item is refreshed via the history store; a collection
-        // element is not, so the edit has to be reflected locally or it
-        // disappears as soon as it is made.
+        const [item, newTags] = wrapper.emitted()["tag-change"].at(-1);
+        expect(item).toBe(elementDataset);
+        expect(newTags).toEqual(["added"]);
+    });
+
+    it("renders the tags the item carries, holding no state of its own", async () => {
+        // Shadowing tags here would mask a change made anywhere else (another tab, a bulk
+        // tag operation) for as long as the row stays mounted.
+        const elementDataset = {
+            id: "elem_id",
+            history_id: "history_id",
+            history_content_type: "dataset",
+            tags: [],
+        };
+        await wrapper.setProps({ item: elementDataset, isHistoryItem: false, taggable: true });
+
+        wrapper.findComponent(StatelessTags).vm.$emit("input", ["added"]);
+        await localVue.nextTick();
+        expect(wrapper.findComponent(StatelessTags).props("value")).toEqual([]);
+
+        // ... and once the owner writes it back, the row shows it.
+        await wrapper.setProps({ item: { ...elementDataset, tags: ["added"] } });
         expect(wrapper.findComponent(StatelessTags).props("value")).toEqual(["added"]);
     });
 });

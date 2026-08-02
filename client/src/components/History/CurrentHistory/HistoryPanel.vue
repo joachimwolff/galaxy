@@ -6,6 +6,7 @@ import { computed, onMounted, ref, set as VueSet, unref, watch } from "vue";
 import { type HistoryItemSummary, type HistorySummaryExtended, userOwnsHistory } from "@/api";
 import { getGalaxyInstance } from "@/app";
 import ExpandedItems from "@/components/History/Content/ExpandedItems";
+import { itemUniqueKey } from "@/components/History/Content/model/itemKey";
 import { HistoryFilters } from "@/components/History/HistoryFilters";
 import { deleteContent, updateContentFields } from "@/components/History/model/queries";
 import { useSelectedItems } from "@/composables/selectedItems/selectedItems";
@@ -365,10 +366,6 @@ function getItemKey(item: HistoryItemSummary) {
     return itemUniqueKey(item);
 }
 
-function itemUniqueKey(item: HistoryItemSummary) {
-    return `${item.history_content_type}-${item.id}`;
-}
-
 onMounted(async () => {
     // `filterable` here indicates if this is the current history panel
     if (props.filterable && !props.filter) {
@@ -400,13 +397,15 @@ const {
 } = useSelectedItems<HistoryItemSummary, typeof ContentItem>({
     scopeKey: queryKey,
     getItemKey: getItemKey,
-    filterText: filterText,
-    totalItemsInQuery: computed(() => totalMatchesCount.value ?? 0),
     allItems: historyItems,
-    filterClass: HistoryFilters,
     selectable: canEditHistory,
-    querySelectionBreak: () => {
-        querySelectionBreak.value = true;
+    querySelection: {
+        filterText: filterText,
+        totalItemsInQuery: computed(() => totalMatchesCount.value ?? 0),
+        filterClass: HistoryFilters,
+        querySelectionBreak: () => {
+            querySelectionBreak.value = true;
+        },
     },
     onDelete,
     expectedKeyDownClass: "content-item",
